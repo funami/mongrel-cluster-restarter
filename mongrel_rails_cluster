@@ -1,0 +1,125 @@
+#!/usr/bin/env ruby
+# Copyright (c) 2008 Takao Funami
+# You can redistribute it and/or modify it under the same terms as Ruby.
+#
+require 'pp'
+require 'rubygems'
+require 'mongrel_cluster/init'
+require 'optparse'
+require 'logger'
+
+include Cluster::ExecBase
+
+logger = Logger.new(STDOUT)
+@config_file = "config/mongrel_cluster.yml" 
+@verbose = nil
+
+args = {
+  "wait"    => 60,
+  "interval"   => 3,
+  "log_lotate" => false,
+  "retry"   => 10,
+}
+opt = OptionParser.new
+opt.banner = "Usage: #{File.basename(__FILE__)} <commnad(start|stop|restart|status)> [options]"
+opt.on('-C','--config PATH','Use a config file',String){|v| @config_file = v}
+opt.on('-w','--wait TIME','Time to wait (in seconds) before ignore stopping process', Integer){|v| args['wait'] = v}
+opt.on('-i','--interval TIME','Time to wait (in seconds) after a port is stopped', Integer){|v| args['interval'] = v}
+opt.on('-L','--with_log_lotate','Lotate a rails logger.info file'){|v| args['with_log_lotate'] = v}
+opt.on('','--clean','Remove orphaned process if needed before stopping'){|v| @clean = v}
+opt.on('','--only PORT','Port number of cluster member',Integer){|v| @only = v}
+opt.on('','--retry TIMES','Number of retry to start after ignore stopped process',Integer){|v| @only = v}
+opt.on('-v','--verbose','Print all called commands and output.'){|v| @verbose = v}
+opt.on('--help', 'show this message') { puts opt; exit }
+opt.parse!(ARGV)
+
+command = ARGV[0]
+exit if validate == false
+
+read_options
+@options.merge! args if args
+if @only
+  @options['with_log_lotate'] = false
+end
+@options['rails_log_file'] = "log/#{@options['environment']}.log"
+Dir::chdir(@options["cwd"]) if @options["cwd"]
+if @verbose
+  log '------------ config ------------'
+  log "#{sprintf("%15s",'config_file')}:#{@config_file}"
+  @options.keys.sort.each do |key|
+    log "#{sprintf("%15s",key)}:#{@options[key]}"
+  end
+  log '--------------------------------'
+end
+
+case command
+when 'start'
+  @ports.each do |port|
+    logger.info `mongrel_rails cluster::start --only #{port}`.chomp
+  end
+when 'stop'
+  @ports.each do |port|
+    logger.info `mongrel_rails cluster::stop --only #{port}`.chomp
+  end
+when 'restart'
+  if @options['with_log_lotate']
+    cmd = "mv #{@options['rails_log_file']} #{@options['rails_log_file']}.#{Time.now.strftime("%Y%m%d%H%M%S")}"
+    `#{cmd}`
+    logger.info "#{cmd}" if $?.success?
+  end
+  next_retry_ports = []
+  @ports.each do |port|
+    logger.info  `mongrel_rails cluster::stop --only #{port}`.chomp
+    # waiting for process to stop complate
+    start_time = Time.now
+    while true
+      wait_time = sprintf("%10.5f", Time.now - start_time)
+      if !check_process(port) and !pid_file_exists?(port)    
+        logger.info `mongrel_rails cluster::start --only #{port}`.chomp
+        break
+      else
+        logger.info "waiting #{wait_time} second for to stop port #{port}" if @verbose 
+      end
+      if Time.now - start_time > @options['wait']
+        logger.info "port #{port} do not finish stopping process in #{@options['wait']} seconds"
+        next_retry_ports << port
+        break 
+      end
+      sleep 1
+    end
+    sleep @options['interval'] if @options['interval'] > 0
+  end
+  @options['retry'].times do |i|
+    break if next_retry_ports.empty?
+    retry_ports = next_retry_ports.clone
+    next_retry_ports = []
+    retry_ports.each do |port|
+      if !check_process(port) and !pid_file_exists?(port)    
+        logger.info `mongrel_rails cluster::start --only #{port}`
+      else
+        logger.info "retry(#{i}) to start port #{port},but this port still running" if @verbose 
+        next_retry_ports << port
+      end
+    end
+    sleep 10
+  end
+  next_retry_ports.each do |port|
+      logger.error "can not restart port #{port}"
+  end
+when 'status'
+  @ports.each do |port|
+    pid = check_process(port)
+    if pid and pid_file_exists?(port)    
+      logger.info "running port #{port}"
+    elsif !pid and !pid_file_exists?(port)    
+      logger.info "stopped port #{port}"
+    elsif pid and !pid_file_exists?(port)    
+      logger.error "runnnig port #{port} ,but #{port_pid_file(port)} is missing"
+    elsif !pid and pid_file_exists?(port)    
+      logger.error "stopped port #{port} ,but #{port_pid_file(port)} is found"
+    end
+  end
+else
+  print opt
+end
+
